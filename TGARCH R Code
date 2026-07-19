@@ -1,0 +1,1576 @@
+# =============================================================================
+# CORRECTED TGARCH-X ROLLING VOLATILITY FORECASTING
+# =============================================================================
+# Purpose:
+#   Produce one-trading-day-ahead sector variance forecasts for the NSE using
+#   rugarch's fGARCH model with submodel = "TGARCH" and a lagged volume
+#   regressor in the variance specification.
+#
+# IMPORTANT MODEL IDENTITY:
+#   This script retains the researcher's intended TGARCH-X model.
+#   It does NOT replace TGARCH with another threshold-GARCH specification.
+#   The exact conditional scale recursion is the fGARCH/TGARCH
+#   parameterization implemented by rugarch. The manuscript equation and
+#   parameter labels must be aligned with that implementation.
+#
+# Key corrections relative to the original script:
+#   1. Firm and sector returns use lagged market-capitalization weights.
+#   2. The intended rugarch specification remains fGARCH/TGARCH.
+#   3. Each sector is estimated on its own valid calendar.
+#   4. Convergence is measured at the sector-date fit level.
+#   5. Fit warnings, fallback reasons, parameters, and forecast validity are saved.
+#   6. Weighted RMSE is sqrt(weighted MSE).
+#   7. Sector weights are frozen before the first forecast date.
+#   8. The incorrect CUSUMSQ label is removed.
+#   9. Residual diagnostics are saved for the last successful fit in each sector.
+#
+# The forecasts are DAILY and one step ahead. The corresponding primary
+# Diebold-Mariano forecast horizon is h = 1.
+# =============================================================================
+
+# =============================================================================
+# 0. LIBRARIES, CONFIGURATION, AND REPRODUCIBILITY
+# =============================================================================
+required_packages <- c(
+  "dplyr",
+  "lubridate",
+  "rugarch",
+  "zoo",
+  "tidyr",
+  "progress",
+  "strucchange"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    paste0(
+      "Install the following packages before running the script: ",
+      paste(missing_packages, collapse = ", ")
+    )
+  )
+}
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(lubridate)
+  library(rugarch)
+  library(zoo)
+  library(tidyr)
+  library(progress)
+  library(strucchange)
+})
+
+SEED <- 42
+set.seed(SEED)
+
+CODE_VERSION <- "tgarch_x_fGARCH_lagcap_daily_v2_01"
+WINDOW_SIZE <- 200L
+RETURN_SCALE <- 100
+TARGET_EPSILON <- 1e-8
+DIAGNOSTIC_LAG <- 10L
+RUN_STABILITY_TESTS <- TRUE
+
+# Use the same data directory as the original TGARCH script.
+DATA_DIR <- "C:/..DATA From Office LapTop/PhD Research Paper/Data/Testing-Data Files/R-Data Import"
+
+# Optional: enter the exact master filename here. Leave as NA to detect a CSV
+# whose filename contains the word "Master".
+MASTER_FILENAME <- NA_character_
+
+if (!dir.exists(DATA_DIR)) {
+  stop(
+    "DATA_DIR does not exist: ", DATA_DIR,
+    "\nConfirm that the folder name and drive match your computer."
+  )
+}
+
+# Retain the original script's working-directory behaviour.
+setwd(DATA_DIR)
+
+OUTPUT_DIR <- file.path(DATA_DIR, "TGARCH_X_Corrected_Output")
+
+if (!dir.exists(OUTPUT_DIR)) {
+  dir.create(OUTPUT_DIR, recursive = TRUE)
+}
+
+cat("Confirmed DATA_DIR: ", normalizePath(DATA_DIR, winslash = "/", mustWork = TRUE), "\n", sep = "")
+
+cat("=============================================================================\n")
+cat("CORRECTED TGARCH-X VOLATILITY FORECASTING\n")
+cat("=============================================================================\n")
+cat("Code version: ", CODE_VERSION, "\n", sep = "")
+cat("Window: ", WINDOW_SIZE, " valid trading observations per sector\n", sep = "")
+cat("Forecast horizon: one trading day\n")
+cat("Distribution: standardized Student-t\n")
+cat("Conditional mean: intercept only\n")
+cat("Variance model: rugarch fGARCH(1,1), submodel TGARCH, with X regressor\n")
+cat("External regressor: lagged sector-volume return, standardized in-window\n")
+cat("Sector-return weights: lagged market capitalization\n")
+cat("=============================================================================\n\n")
+
+# =============================================================================
+# 1. LOAD THE MASTER FILE
+# =============================================================================
+csv_files <- list.files(
+  path = DATA_DIR,
+  pattern = "\\.csv$",
+  ignore.case = TRUE,
+  full.names = TRUE
+)
+
+cat("CSV files found in DATA_DIR: ", length(csv_files), "\n", sep = "")
+if (length(csv_files) > 0) {
+  cat(paste0("  - ", basename(csv_files), collapse = "\n"), "\n")
+}
+
+if (!is.na(MASTER_FILENAME) && nzchar(MASTER_FILENAME)) {
+  master_file <- file.path(DATA_DIR, MASTER_FILENAME)
+  
+  if (!file.exists(master_file)) {
+    stop(
+      "MASTER_FILENAME was specified but the file does not exist: ",
+      master_file
+    )
+  }
+} else {
+  master_candidates <- csv_files[
+    grepl("Master", basename(csv_files), ignore.case = TRUE)
+  ]
+  
+  if (length(master_candidates) == 0) {
+    stop(
+      "No CSV filename containing 'Master' was found in:\n",
+      normalizePath(DATA_DIR, winslash = "/", mustWork = TRUE),
+      "\nEither place the master CSV in this folder or set ",
+      "MASTER_FILENAME to its exact filename near the top of the script."
+    )
+  }
+  
+  if (length(master_candidates) > 1) {
+    stop(
+      "Multiple candidate master files were found. Set MASTER_FILENAME ",
+      "to the exact file to use. Candidates: ",
+      paste(basename(master_candidates), collapse = ", ")
+    )
+  }
+  
+  master_file <- master_candidates[1]
+}
+
+cat("Master file selected: ", normalizePath(master_file, winslash = "/", mustWork = TRUE), "\n\n", sep = "")
+
+df <- read.csv(
+  master_file,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+# =============================================================================
+# 2. STANDARDIZE COLUMN NAMES AND CLEAN INPUTS
+# =============================================================================
+for (i in seq_along(names(df))) {
+  current_name <- names(df)[i]
+  
+  if (grepl("Market.*Capitalization", current_name, ignore.case = TRUE)) {
+    names(df)[i] <- "Market_Cap"
+  } else if (identical(current_name, "Category")) {
+    names(df)[i] <- "Sector"
+  }
+}
+
+names(df) <- gsub(" ", "_", gsub("[()]", "", names(df)))
+
+required_columns <- c(
+  "Date",
+  "Sector",
+  "Stock",
+  "Close",
+  "Volume",
+  "Market_Cap"
+)
+
+missing_columns <- setdiff(required_columns, names(df))
+
+if (length(missing_columns) > 0) {
+  stop(
+    "Master data are missing required columns: ",
+    paste(missing_columns, collapse = ", ")
+  )
+}
+
+parse_day_first_date <- function(x) {
+  x <- as.character(x)
+  
+  parsed <- suppressWarnings(as.Date(x, format = "%d/%m/%Y"))
+  unresolved <- is.na(parsed)
+  
+  if (any(unresolved)) {
+    parsed[unresolved] <- suppressWarnings(
+      as.Date(x[unresolved], format = "%Y-%m-%d")
+    )
+  }
+  
+  parsed
+}
+
+to_numeric_clean <- function(x) {
+  suppressWarnings(
+    as.numeric(
+      gsub(",", "", as.character(x), fixed = TRUE)
+    )
+  )
+}
+
+df <- df %>%
+  mutate(
+    Date = parse_day_first_date(Date),
+    Sector = trimws(gsub("\\s+", " ", as.character(Sector))),
+    Stock = trimws(gsub("\\s+", " ", as.character(Stock))),
+    Close = to_numeric_clean(Close),
+    Market_Cap = to_numeric_clean(Market_Cap),
+    Trading_Volume = to_numeric_clean(Volume)
+  )
+
+if (anyDuplicated(df[, c("Sector", "Stock", "Date")]) > 0) {
+  duplicate_rows <- df %>%
+    count(Sector, Stock, Date, name = "N") %>%
+    filter(N > 1)
+  
+  print(head(duplicate_rows, 20))
+  stop("Duplicate Sector-Stock-Date observations were found.")
+}
+
+invalid_core_rows <- df %>%
+  filter(
+    is.na(Date) |
+      is.na(Sector) |
+      Sector == "" |
+      is.na(Stock) |
+      Stock == "" |
+      !is.finite(Close) |
+      Close <= 0 |
+      !is.finite(Market_Cap) |
+      Market_Cap <= 0
+  )
+
+if (nrow(invalid_core_rows) > 0) {
+  cat(
+    "Removing ",
+    nrow(invalid_core_rows),
+    " rows with invalid core fields.\n",
+    sep = ""
+  )
+}
+
+df <- df %>%
+  filter(
+    !is.na(Date),
+    !is.na(Sector),
+    Sector != "",
+    !is.na(Stock),
+    Stock != "",
+    is.finite(Close),
+    Close > 0,
+    is.finite(Market_Cap),
+    Market_Cap > 0
+  )
+
+if (nrow(df) == 0) {
+  stop("No valid observations remain after cleaning.")
+}
+
+# =============================================================================
+# 3. CONSTRUCT FIRM RETURNS AND LAGGED MARKET-CAPITALIZATION WEIGHTS
+# =============================================================================
+firm_panel <- df %>%
+  arrange(Sector, Stock, Date) %>%
+  group_by(Sector, Stock) %>%
+  mutate(
+    Stock_Return = log(Close / lag(Close)),
+    Market_Cap_Lag1 = lag(Market_Cap)
+  ) %>%
+  ungroup() %>%
+  filter(
+    is.finite(Stock_Return),
+    is.finite(Market_Cap_Lag1),
+    Market_Cap_Lag1 > 0
+  )
+
+if (nrow(firm_panel) == 0) {
+  stop("No valid firm-return observations were constructed.")
+}
+
+# =============================================================================
+# 4. CONSTRUCT ONE COMMON SECTOR-RETURN SERIES
+# =============================================================================
+# The same sector return is used:
+#   - as the TGARCH-X dependent variable; and
+#   - to construct the one-day squared-return evaluation target.
+#
+# This avoids the original discrepancy between target construction and model
+# construction. Volume availability affects the exogenous regressor, not the
+# definition of the sector return itself.
+sector_daily <- firm_panel %>%
+  group_by(Date, Sector) %>%
+  summarise(
+    Weighted_Return_Sum = sum(
+      Market_Cap_Lag1 * Stock_Return,
+      na.rm = TRUE
+    ),
+    Sector_Cap_Lag1 = sum(
+      Market_Cap_Lag1,
+      na.rm = TRUE
+    ),
+    Sector_Volume = if (
+      sum(is.finite(Trading_Volume)) > 0
+    ) {
+      sum(Trading_Volume[is.finite(Trading_Volume)], na.rm = TRUE)
+    } else {
+      NA_real_
+    },
+    N_Stocks = n_distinct(Stock),
+    N_Volume_Stocks = sum(is.finite(Trading_Volume)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Sector_Return = Weighted_Return_Sum / Sector_Cap_Lag1
+  ) %>%
+  filter(
+    is.finite(Sector_Return),
+    is.finite(Sector_Cap_Lag1),
+    Sector_Cap_Lag1 > 0
+  ) %>%
+  arrange(Sector, Date)
+
+if (anyDuplicated(sector_daily[, c("Sector", "Date")]) > 0) {
+  stop("Duplicate Sector-Date rows were created.")
+}
+
+# =============================================================================
+# 5. CONSTRUCT THE FIXED ONE-DAY ACTUAL VARIANCE TARGET
+# =============================================================================
+common_actual <- sector_daily %>%
+  transmute(
+    Date,
+    Sector,
+    Sector_Return,
+    N_Stocks,
+    Sector_Cap_Lag1,
+    Actual_Variance_Raw = Sector_Return^2,
+    Actual_Variance = pmax(
+      Sector_Return^2,
+      TARGET_EPSILON
+    ),
+    Code_Version = CODE_VERSION
+  ) %>%
+  arrange(Sector, Date)
+
+write.csv(
+  common_actual,
+  file.path(
+    OUTPUT_DIR,
+    "Common_Actual_Variance_1Day_Squared_Return.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("Common one-day target rows: ", nrow(common_actual), "\n", sep = "")
+cat(
+  "Target date range: ",
+  min(common_actual$Date),
+  " to ",
+  max(common_actual$Date),
+  "\n\n",
+  sep = ""
+)
+
+# =============================================================================
+# 6. CONSTRUCT THE LAGGED VOLUME REGRESSOR
+# =============================================================================
+sector_model_data <- sector_daily %>%
+  group_by(Sector) %>%
+  arrange(Date, .by_group = TRUE) %>%
+  mutate(
+    Volume_Return = ifelse(
+      is.finite(Sector_Volume) &
+        Sector_Volume > 0 &
+        is.finite(lag(Sector_Volume)) &
+        lag(Sector_Volume) > 0,
+      log(Sector_Volume / lag(Sector_Volume)),
+      NA_real_
+    ),
+    # For a forecast dated t, this is the sector-volume return known at t-1.
+    Volume_Return_Lag1 = lag(Volume_Return, 1)
+  ) %>%
+  ungroup() %>%
+  filter(
+    is.finite(Sector_Return),
+    is.finite(Volume_Return_Lag1),
+    is.finite(Sector_Cap_Lag1),
+    Sector_Cap_Lag1 > 0
+  ) %>%
+  arrange(Sector, Date)
+
+sector_counts <- sector_model_data %>%
+  count(Sector, name = "N_Valid_Observations") %>%
+  arrange(Sector)
+
+write.csv(
+  sector_counts,
+  file.path(OUTPUT_DIR, "TGARCH_X_Sector_Observation_Counts.csv"),
+  row.names = FALSE
+)
+
+insufficient_sectors <- sector_counts %>%
+  filter(N_Valid_Observations <= WINDOW_SIZE)
+
+if (nrow(insufficient_sectors) > 0) {
+  print(insufficient_sectors)
+  stop(
+    "At least one sector has insufficient observations for a ",
+    WINDOW_SIZE,
+    "-observation estimation window plus one forecast."
+  )
+}
+
+# =============================================================================
+# 7. HELPER FUNCTIONS
+# =============================================================================
+safe_variance <- function(x, epsilon = TARGET_EPSILON) {
+  value <- suppressWarnings(var(x, na.rm = TRUE))
+  
+  if (!is.finite(value) || value <= 0) {
+    value <- epsilon
+  }
+  
+  max(value, epsilon)
+}
+
+standardize_training_regressor <- function(x) {
+  x <- as.numeric(x)
+  
+  center <- mean(x, na.rm = TRUE)
+  scale <- sd(x, na.rm = TRUE)
+  
+  if (!is.finite(center)) {
+    stop("The exogenous regressor has a non-finite training mean.")
+  }
+  
+  if (!is.finite(scale) || scale < 1e-12) {
+    scale <- 1
+  }
+  
+  list(
+    values = (x - center) / scale,
+    center = center,
+    scale = scale
+  )
+}
+
+capture_ugarch_fit <- function(specification, data_vector) {
+  warning_messages <- character(0)
+  error_message <- NA_character_
+  
+  fit_object <- tryCatch(
+    withCallingHandlers(
+      ugarchfit(
+        spec = specification,
+        data = data_vector,
+        solver = "hybrid",
+        solver.control = list(trace = 0),
+        fit.control = list(
+          stationarity = 1,
+          scale = 0
+        )
+      ),
+      warning = function(w) {
+        warning_messages <<- c(
+          warning_messages,
+          conditionMessage(w)
+        )
+        invokeRestart("muffleWarning")
+      }
+    ),
+    error = function(e) {
+      error_message <<- conditionMessage(e)
+      NULL
+    }
+  )
+  
+  list(
+    fit = fit_object,
+    warning = if (
+      length(warning_messages) > 0
+    ) {
+      paste(unique(warning_messages), collapse = " | ")
+    } else {
+      NA_character_
+    },
+    error = error_message
+  )
+}
+
+extract_parameter <- function(parameter_vector, parameter_name) {
+  if (parameter_name %in% names(parameter_vector)) {
+    return(as.numeric(parameter_vector[parameter_name]))
+  }
+  
+  NA_real_
+}
+
+arch_lm_test <- function(standardized_residuals, lags = 10L) {
+  z <- as.numeric(standardized_residuals)
+  z <- z[is.finite(z)]
+  
+  if (length(z) <= lags + 5L) {
+    return(
+      data.frame(
+        Statistic = NA_real_,
+        DF = lags,
+        P_Value = NA_real_
+      )
+    )
+  }
+  
+  squared <- z^2
+  embedded <- embed(squared, lags + 1L)
+  
+  dependent <- embedded[, 1]
+  regressors <- embedded[, -1, drop = FALSE]
+  
+  auxiliary_fit <- lm(dependent ~ regressors)
+  r_squared <- summary(auxiliary_fit)$r.squared
+  statistic <- nrow(embedded) * r_squared
+  p_value <- pchisq(
+    statistic,
+    df = lags,
+    lower.tail = FALSE
+  )
+  
+  data.frame(
+    Statistic = statistic,
+    DF = lags,
+    P_Value = p_value
+  )
+}
+
+# =============================================================================
+# 8. ROLLING TGARCH-X FORECASTS, SECTOR BY SECTOR
+# =============================================================================
+sectors <- sort(unique(sector_model_data$Sector))
+
+total_forecasts <- sum(
+  vapply(
+    sectors,
+    function(sector_name) {
+      nrow(
+        sector_model_data %>%
+          filter(Sector == sector_name)
+      ) - WINDOW_SIZE
+    },
+    numeric(1)
+  )
+)
+
+if (total_forecasts <= 0) {
+  stop("No rolling forecasts can be generated.")
+}
+
+results <- vector("list", total_forecasts)
+result_index <- 0L
+successful_fits <- 0L
+fallback_fits <- 0L
+last_successful_fit <- list()
+last_successful_fit_metadata <- list()
+
+progress <- progress_bar$new(
+  format = paste0(
+    "[:bar] :percent | :current/:total | ",
+    "valid TGARCH-X: :success | fallback: :fallback | ETA: :eta"
+  ),
+  total = total_forecasts,
+  clear = FALSE,
+  width = 100
+)
+
+start_time <- Sys.time()
+
+for (sector_name in sectors) {
+  sector_data <- sector_model_data %>%
+    filter(Sector == sector_name) %>%
+    arrange(Date)
+  
+  n_sector <- nrow(sector_data)
+  n_sector_forecasts <- n_sector - WINDOW_SIZE
+  
+  for (roll_index in seq_len(n_sector_forecasts)) {
+    train_indices <- roll_index:(
+      roll_index + WINDOW_SIZE - 1L
+    )
+    forecast_index <- roll_index + WINDOW_SIZE
+    
+    training_data <- sector_data[
+      train_indices,
+      ,
+      drop = FALSE
+    ]
+    
+    forecast_row <- sector_data[
+      forecast_index,
+      ,
+      drop = FALSE
+    ]
+    
+    y_unscaled <- training_data$Sector_Return
+    y_scaled <- y_unscaled * RETURN_SCALE
+    
+    fallback_variance <- safe_variance(y_unscaled)
+    
+    regressor_scaling <- standardize_training_regressor(
+      training_data$Volume_Return_Lag1
+    )
+    
+    x_training <- matrix(
+      regressor_scaling$values,
+      ncol = 1
+    )
+    colnames(x_training) <- "Volume_Return_Lag1_z"
+    
+    x_next_value <- (
+      forecast_row$Volume_Return_Lag1 -
+        regressor_scaling$center
+    ) / regressor_scaling$scale
+    
+    x_forecast <- matrix(
+      x_next_value,
+      nrow = 1,
+      ncol = 1
+    )
+    colnames(x_forecast) <- "Volume_Return_Lag1_z"
+    
+    result_index <- result_index + 1L
+    
+    forecast_variance <- fallback_variance
+    fit_converged <- FALSE
+    forecast_valid <- FALSE
+    used_fallback <- TRUE
+    failure_reason <- NA_character_
+    fit_warning <- NA_character_
+    fit_error <- NA_character_
+    
+    mu_value <- NA_real_
+    omega_value <- NA_real_
+    alpha_value <- NA_real_
+    beta_value <- NA_real_
+    eta_value <- NA_real_
+    delta_value <- NA_real_
+    shape_value <- NA_real_
+    persistence_value <- NA_real_
+    
+    specification <- tryCatch(
+      ugarchspec(
+        mean.model = list(
+          armaOrder = c(0, 0),
+          include.mean = TRUE
+        ),
+        variance.model = list(
+          model = "fGARCH",
+          submodel = "TGARCH",
+          garchOrder = c(1, 1),
+          external.regressors = x_training,
+          variance.targeting = FALSE
+        ),
+        distribution.model = "std"
+      ),
+      error = function(e) {
+        fit_error <<- conditionMessage(e)
+        NULL
+      }
+    )
+    
+    fit_capture <- NULL
+    fit_object <- NULL
+    
+    if (is.null(specification)) {
+      failure_reason <- "specification_error"
+    } else {
+      fit_capture <- capture_ugarch_fit(
+        specification,
+        y_scaled
+      )
+      
+      fit_object <- fit_capture$fit
+      fit_warning <- fit_capture$warning
+      fit_error <- fit_capture$error
+      
+      if (is.null(fit_object)) {
+        failure_reason <- "fit_error"
+      } else {
+        convergence_code <- tryCatch(
+          convergence(fit_object),
+          error = function(e) NA_integer_
+        )
+        
+        fit_converged <- isTRUE(
+          is.finite(convergence_code) &&
+            convergence_code == 0
+        )
+        
+        if (!fit_converged) {
+          failure_reason <- "fit_nonconvergence"
+        } else {
+          forecast_object <- tryCatch(
+            ugarchforecast(
+              fit_object,
+              n.ahead = 1,
+              external.forecasts = list(
+                vregfor = x_forecast
+              )
+            ),
+            error = function(e) {
+              fit_error <<- paste(
+                na.omit(
+                  c(
+                    fit_error,
+                    conditionMessage(e)
+                  )
+                ),
+                collapse = " | "
+              )
+              NULL
+            }
+          )
+          
+          if (is.null(forecast_object)) {
+            failure_reason <- "forecast_error"
+          } else {
+            sigma_forecast_scaled <- tryCatch(
+              as.numeric(
+                sigma(forecast_object)[1]
+              ),
+              error = function(e) NA_real_
+            )
+            
+            candidate_variance <- (
+              sigma_forecast_scaled / RETURN_SCALE
+            )^2
+            
+            forecast_valid <- (
+              length(candidate_variance) == 1L &&
+                is.finite(candidate_variance) &&
+                candidate_variance > 0
+            )
+            
+            if (forecast_valid) {
+              forecast_variance <- max(
+                candidate_variance,
+                TARGET_EPSILON
+              )
+              used_fallback <- FALSE
+              failure_reason <- NA_character_
+              successful_fits <- successful_fits + 1L
+              
+              parameters <- coef(fit_object)
+              
+              mu_value <- extract_parameter(parameters, "mu")
+              omega_value <- extract_parameter(parameters, "omega")
+              alpha_value <- extract_parameter(parameters, "alpha1")
+              beta_value <- extract_parameter(parameters, "beta1")
+              eta_names <- grep("^eta", names(parameters), value = TRUE)
+              eta_value <- if (length(eta_names) > 0L) {
+                as.numeric(parameters[eta_names[1L]])
+              } else {
+                NA_real_
+              }
+              delta_value <- extract_parameter(parameters, "vxreg1")
+              shape_value <- extract_parameter(parameters, "shape")
+              
+              persistence_value <- tryCatch(
+                as.numeric(
+                  rugarch::persistence(fit_object)
+                ),
+                error = function(e) NA_real_
+              )
+              
+              last_successful_fit[[sector_name]] <- fit_object
+              last_successful_fit_metadata[[sector_name]] <- data.frame(
+                Sector = sector_name,
+                Window_Start_Date = min(training_data$Date),
+                Window_End_Date = max(training_data$Date),
+                Forecast_Date = forecast_row$Date,
+                stringsAsFactors = FALSE
+              )
+            } else {
+              failure_reason <- "nonfinite_or_nonpositive_forecast"
+            }
+          }
+        }
+      }
+    }
+    
+    if (used_fallback) {
+      fallback_fits <- fallback_fits + 1L
+    }
+    
+    results[[result_index]] <- data.frame(
+      Date = forecast_row$Date,
+      Sector = sector_name,
+      Window_Start_Date = min(training_data$Date),
+      Window_End_Date = max(training_data$Date),
+      Window_Observations = WINDOW_SIZE,
+      Forecast_Variance = forecast_variance,
+      Actual_Variance = pmax(
+        forecast_row$Sector_Return^2,
+        TARGET_EPSILON
+      ),
+      Actual_Variance_Raw = forecast_row$Sector_Return^2,
+      Sector_Return = forecast_row$Sector_Return,
+      Sector_Cap_Lag1 = forecast_row$Sector_Cap_Lag1,
+      N_Stocks = forecast_row$N_Stocks,
+      Volume_Return_Lag1 = forecast_row$Volume_Return_Lag1,
+      Volume_Regressor_Training_Mean = regressor_scaling$center,
+      Volume_Regressor_Training_SD = regressor_scaling$scale,
+      Converged = fit_converged,
+      Forecast_Valid = forecast_valid,
+      Used_Fallback = used_fallback,
+      Failure_Reason = failure_reason,
+      Fit_Warning = fit_warning,
+      Fit_Error = fit_error,
+      Mu = mu_value,
+      Omega = omega_value,
+      Alpha1 = alpha_value,
+      Beta1 = beta_value,
+      Eta = eta_value,
+      Volume_Coefficient = delta_value,
+      Shape = shape_value,
+      Persistence = persistence_value,
+      Model = "fGARCH-TGARCH-X(1,1)",
+      Forecast_Horizon = 1L,
+      Code_Version = CODE_VERSION,
+      stringsAsFactors = FALSE
+    )
+    
+    progress$tick(
+      tokens = list(
+        success = successful_fits,
+        fallback = fallback_fits
+      )
+    )
+  }
+}
+
+end_time <- Sys.time()
+results_df <- bind_rows(results)
+
+if (nrow(results_df) != total_forecasts) {
+  stop("Internal error: generated forecast count does not match expectation.")
+}
+
+if (anyDuplicated(results_df[, c("Sector", "Date")]) > 0) {
+  stop("Duplicate Sector-Date forecasts were generated.")
+}
+
+if (
+  any(
+    !is.finite(results_df$Forecast_Variance) |
+    results_df$Forecast_Variance <= 0
+  )
+) {
+  stop("Non-finite or non-positive forecast variances remain.")
+}
+
+write.csv(
+  results_df,
+  file.path(OUTPUT_DIR, "TGARCH_X_Forecast_Results.csv"),
+  row.names = FALSE
+)
+
+# =============================================================================
+# 9. CONVERGENCE AND FALLBACK REPORTING
+# =============================================================================
+fit_summary_overall <- results_df %>%
+  summarise(
+    Total_Sector_Date_Fits = n(),
+    Valid_TGARCH_X_Forecasts = sum(
+      Forecast_Valid,
+      na.rm = TRUE
+    ),
+    Fallback_Forecasts = sum(
+      Used_Fallback,
+      na.rm = TRUE
+    ),
+    Valid_Forecast_Rate = mean(
+      Forecast_Valid,
+      na.rm = TRUE
+    ),
+    Fallback_Rate = mean(
+      Used_Fallback,
+      na.rm = TRUE
+    ),
+    Code_Version = CODE_VERSION
+  )
+
+fit_summary_by_sector <- results_df %>%
+  group_by(Sector) %>%
+  summarise(
+    N_Forecasts = n(),
+    N_Converged = sum(Converged, na.rm = TRUE),
+    N_Valid_Forecasts = sum(Forecast_Valid, na.rm = TRUE),
+    N_Fallback = sum(Used_Fallback, na.rm = TRUE),
+    Convergence_Rate = mean(Converged, na.rm = TRUE),
+    Valid_Forecast_Rate = mean(Forecast_Valid, na.rm = TRUE),
+    Fallback_Rate = mean(Used_Fallback, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+failure_summary <- results_df %>%
+  filter(Used_Fallback) %>%
+  mutate(
+    Failure_Reason = ifelse(
+      is.na(Failure_Reason),
+      "unspecified",
+      Failure_Reason
+    )
+  ) %>%
+  count(Sector, Failure_Reason, name = "N") %>%
+  arrange(Sector, desc(N))
+
+write.csv(
+  fit_summary_overall,
+  file.path(OUTPUT_DIR, "TGARCH_X_Fit_Summary_Overall.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  fit_summary_by_sector,
+  file.path(OUTPUT_DIR, "TGARCH_X_Fit_Summary_by_Sector.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  failure_summary,
+  file.path(OUTPUT_DIR, "TGARCH_X_Failure_Reasons.csv"),
+  row.names = FALSE
+)
+
+# =============================================================================
+# 10. FREEZE SECTOR WEIGHTS BEFORE THE FIRST FORECAST DATE
+# =============================================================================
+first_forecast_date <- min(results_df$Date)
+
+pre_forecast_caps <- sector_daily %>%
+  filter(Date < first_forecast_date) %>%
+  group_by(Date) %>%
+  mutate(
+    Total_Market_Cap_Lag1 = sum(
+      Sector_Cap_Lag1,
+      na.rm = TRUE
+    ),
+    Sector_Weight = (
+      Sector_Cap_Lag1 /
+        Total_Market_Cap_Lag1
+    )
+  ) %>%
+  ungroup() %>%
+  filter(
+    is.finite(Sector_Weight),
+    Sector_Weight >= 0
+  )
+
+if (nrow(pre_forecast_caps) == 0) {
+  stop(
+    "No observations are available to estimate pre-forecast sector weights."
+  )
+}
+
+sector_weights <- pre_forecast_caps %>%
+  group_by(Sector) %>%
+  summarise(
+    Weight = mean(
+      Sector_Weight,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  ) %>%
+  filter(
+    Sector %in% unique(results_df$Sector)
+  )
+
+missing_weight_sectors <- setdiff(
+  unique(results_df$Sector),
+  sector_weights$Sector
+)
+
+if (length(missing_weight_sectors) > 0) {
+  stop(
+    "Missing frozen weights for sectors: ",
+    paste(missing_weight_sectors, collapse = ", ")
+  )
+}
+
+sector_weights <- sector_weights %>%
+  mutate(
+    Weight = Weight / sum(Weight)
+  )
+
+write.csv(
+  sector_weights,
+  file.path(OUTPUT_DIR, "TGARCH_X_Frozen_Sector_Weights.csv"),
+  row.names = FALSE
+)
+
+# =============================================================================
+# 11. FORECAST-ACCURACY METRICS
+# =============================================================================
+metrics_df <- results_df %>%
+  left_join(
+    sector_weights,
+    by = "Sector"
+  ) %>%
+  mutate(
+    Forecast_Variance = pmax(
+      Forecast_Variance,
+      TARGET_EPSILON
+    ),
+    Actual_Variance = pmax(
+      Actual_Variance,
+      TARGET_EPSILON
+    ),
+    Forecast_Volatility = sqrt(Forecast_Variance),
+    Actual_Volatility = sqrt(Actual_Variance),
+    Squared_Error = (
+      Actual_Variance -
+        Forecast_Variance
+    )^2,
+    Absolute_Error = abs(
+      Actual_Variance -
+        Forecast_Variance
+    ),
+    QLIKE_i = (
+      Actual_Variance /
+        Forecast_Variance
+    ) -
+      log(
+        Actual_Variance /
+          Forecast_Variance
+      ) -
+      1
+  )
+
+sector_losses <- metrics_df %>%
+  group_by(Sector, Weight) %>%
+  summarise(
+    N = n(),
+    N_Fallback = sum(Used_Fallback, na.rm = TRUE),
+    MSE = mean(Squared_Error, na.rm = TRUE),
+    RMSE = sqrt(MSE),
+    MAE = mean(Absolute_Error, na.rm = TRUE),
+    QLIKE = mean(QLIKE_i, na.rm = TRUE),
+    Mean_Eta = mean(Eta, na.rm = TRUE),
+    Mean_Volume_Coefficient = mean(
+      Volume_Coefficient,
+      na.rm = TRUE
+    ),
+    Mean_Persistence = mean(
+      Persistence,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  )
+
+weighted_metrics <- sector_losses %>%
+  summarise(
+    N_Sectors = n(),
+    RMSE = sqrt(
+      sum(Weight * MSE, na.rm = TRUE) /
+        sum(Weight[is.finite(MSE)])
+    ),
+    MAE = sum(
+      Weight * MAE,
+      na.rm = TRUE
+    ) / sum(
+      Weight[is.finite(MAE)]
+    ),
+    QLIKE = sum(
+      Weight * QLIKE,
+      na.rm = TRUE
+    ) / sum(
+      Weight[is.finite(QLIKE)]
+    ),
+    Code_Version = CODE_VERSION
+  )
+
+# Robustness metrics that exclude fallback forecasts.
+metrics_without_fallback <- metrics_df %>%
+  filter(!Used_Fallback)
+
+if (nrow(metrics_without_fallback) > 0) {
+  sector_losses_without_fallback <- metrics_without_fallback %>%
+    group_by(Sector, Weight) %>%
+    summarise(
+      N = n(),
+      MSE = mean(Squared_Error, na.rm = TRUE),
+      RMSE = sqrt(MSE),
+      MAE = mean(Absolute_Error, na.rm = TRUE),
+      QLIKE = mean(QLIKE_i, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  weighted_metrics_without_fallback <- sector_losses_without_fallback %>%
+    summarise(
+      N_Sectors = n(),
+      RMSE = sqrt(
+        sum(Weight * MSE, na.rm = TRUE) /
+          sum(Weight[is.finite(MSE)])
+      ),
+      MAE = sum(
+        Weight * MAE,
+        na.rm = TRUE
+      ) / sum(
+        Weight[is.finite(MAE)]
+      ),
+      QLIKE = sum(
+        Weight * QLIKE,
+        na.rm = TRUE
+      ) / sum(
+        Weight[is.finite(QLIKE)]
+      ),
+      Code_Version = CODE_VERSION
+    )
+} else {
+  sector_losses_without_fallback <- data.frame(
+    Message = "No non-fallback forecasts were available."
+  )
+  weighted_metrics_without_fallback <- data.frame(
+    Message = "No non-fallback forecasts were available."
+  )
+}
+
+write.csv(
+  sector_losses,
+  file.path(OUTPUT_DIR, "TGARCH_X_Accuracy_by_Sector.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  weighted_metrics,
+  file.path(OUTPUT_DIR, "TGARCH_X_Accuracy_Weighted.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  metrics_df,
+  file.path(OUTPUT_DIR, "TGARCH_X_Forecasts_CLEAN.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  sector_losses_without_fallback,
+  file.path(
+    OUTPUT_DIR,
+    "TGARCH_X_Accuracy_by_Sector_Excluding_Fallback.csv"
+  ),
+  row.names = FALSE
+)
+
+write.csv(
+  weighted_metrics_without_fallback,
+  file.path(
+    OUTPUT_DIR,
+    "TGARCH_X_Accuracy_Weighted_Excluding_Fallback.csv"
+  ),
+  row.names = FALSE
+)
+
+# =============================================================================
+# 12. RESIDUAL DIAGNOSTICS FOR THE LAST SUCCESSFUL FIT IN EACH SECTOR
+# =============================================================================
+diagnostic_rows <- list()
+sign_bias_rows <- list()
+
+for (sector_name in names(last_successful_fit)) {
+  fit_object <- last_successful_fit[[sector_name]]
+  metadata <- last_successful_fit_metadata[[sector_name]]
+  
+  standardized_residuals <- tryCatch(
+    as.numeric(
+      residuals(
+        fit_object,
+        standardize = TRUE
+      )
+    ),
+    error = function(e) numeric(0)
+  )
+  
+  standardized_residuals <- standardized_residuals[
+    is.finite(standardized_residuals)
+  ]
+  
+  diagnostic_lag <- min(
+    DIAGNOSTIC_LAG,
+    max(
+      1L,
+      floor(length(standardized_residuals) / 5L)
+    )
+  )
+  
+  lb_residual <- if (
+    length(standardized_residuals) > diagnostic_lag + 2L
+  ) {
+    Box.test(
+      standardized_residuals,
+      lag = diagnostic_lag,
+      type = "Ljung-Box"
+    )
+  } else {
+    NULL
+  }
+  
+  lb_squared <- if (
+    length(standardized_residuals) > diagnostic_lag + 2L
+  ) {
+    Box.test(
+      standardized_residuals^2,
+      lag = diagnostic_lag,
+      type = "Ljung-Box"
+    )
+  } else {
+    NULL
+  }
+  
+  arch_lm <- arch_lm_test(
+    standardized_residuals,
+    lags = diagnostic_lag
+  )
+  
+  persistence_value <- tryCatch(
+    as.numeric(
+      rugarch::persistence(fit_object)
+    ),
+    error = function(e) NA_real_
+  )
+  
+  diagnostic_rows[[sector_name]] <- data.frame(
+    Sector = sector_name,
+    Window_Start_Date = metadata$Window_Start_Date,
+    Window_End_Date = metadata$Window_End_Date,
+    Forecast_Date = metadata$Forecast_Date,
+    Diagnostic_Lag = diagnostic_lag,
+    Ljung_Box_Residual_Statistic = if (
+      is.null(lb_residual)
+    ) {
+      NA_real_
+    } else {
+      as.numeric(lb_residual$statistic)
+    },
+    Ljung_Box_Residual_P_Value = if (
+      is.null(lb_residual)
+    ) {
+      NA_real_
+    } else {
+      lb_residual$p.value
+    },
+    Ljung_Box_Squared_Residual_Statistic = if (
+      is.null(lb_squared)
+    ) {
+      NA_real_
+    } else {
+      as.numeric(lb_squared$statistic)
+    },
+    Ljung_Box_Squared_Residual_P_Value = if (
+      is.null(lb_squared)
+    ) {
+      NA_real_
+    } else {
+      lb_squared$p.value
+    },
+    ARCH_LM_Statistic = arch_lm$Statistic,
+    ARCH_LM_DF = arch_lm$DF,
+    ARCH_LM_P_Value = arch_lm$P_Value,
+    Persistence = persistence_value,
+    Code_Version = CODE_VERSION,
+    stringsAsFactors = FALSE
+  )
+  
+  sign_bias_output <- tryCatch(
+    rugarch::signbias(fit_object),
+    error = function(e) NULL
+  )
+  
+  if (!is.null(sign_bias_output)) {
+    sign_bias_df <- as.data.frame(
+      sign_bias_output,
+      stringsAsFactors = FALSE
+    )
+    sign_bias_df$Test <- rownames(sign_bias_df)
+    rownames(sign_bias_df) <- NULL
+    sign_bias_df$Sector <- sector_name
+    sign_bias_df$Window_End_Date <- metadata$Window_End_Date
+    sign_bias_df$Forecast_Date <- metadata$Forecast_Date
+    sign_bias_df$Code_Version <- CODE_VERSION
+    
+    sign_bias_rows[[sector_name]] <- sign_bias_df
+  }
+}
+
+diagnostics_df <- if (
+  length(diagnostic_rows) > 0
+) {
+  bind_rows(diagnostic_rows)
+} else {
+  data.frame(
+    Message = "No successful TGARCH-X fit was available for diagnostics."
+  )
+}
+
+sign_bias_df <- if (
+  length(sign_bias_rows) > 0
+) {
+  bind_rows(sign_bias_rows)
+} else {
+  data.frame(
+    Message = "No successful TGARCH-X fit was available for sign-bias tests."
+  )
+}
+
+write.csv(
+  diagnostics_df,
+  file.path(
+    OUTPUT_DIR,
+    "TGARCH_X_Last_Successful_Fit_Diagnostics.csv"
+  ),
+  row.names = FALSE
+)
+
+write.csv(
+  sign_bias_df,
+  file.path(
+    OUTPUT_DIR,
+    "TGARCH_X_Last_Successful_Fit_Sign_Bias.csv"
+  ),
+  row.names = FALSE
+)
+
+# =============================================================================
+# 13. OPTIONAL FORECAST-ERROR STABILITY ANALYSIS
+# =============================================================================
+# This is exploratory and belongs in supporting information, not the primary
+# forecasting comparison. The original incorrectly labelled a generic
+# fluctuation process as "CUSUMSQ"; that test is not reproduced here.
+if (isTRUE(RUN_STABILITY_TESTS)) {
+  forecast_errors_df <- metrics_df %>%
+    group_by(Date) %>%
+    summarise(
+      Weight_Sum = sum(
+        Weight,
+        na.rm = TRUE
+      ),
+      Error = sum(
+        Weight * (
+          Actual_Volatility -
+            Forecast_Volatility
+        ),
+        na.rm = TRUE
+      ) / Weight_Sum,
+      .groups = "drop"
+    ) %>%
+    filter(
+      is.finite(Error),
+      is.finite(Weight_Sum),
+      Weight_Sum > 0
+    ) %>%
+    arrange(Date)
+  
+  write.csv(
+    forecast_errors_df,
+    file.path(
+      OUTPUT_DIR,
+      "TGARCH_X_Forecast_Errors.csv"
+    ),
+    row.names = FALSE
+  )
+  
+  if (nrow(forecast_errors_df) >= 40) {
+    recursive_cusum <- efp(
+      Error ~ 1,
+      data = forecast_errors_df,
+      type = "Rec-CUSUM"
+    )
+    
+    recursive_cusum_result <- sctest(
+      recursive_cusum
+    )
+    
+    cusum_result_df <- data.frame(
+      Test = "Recursive CUSUM",
+      Statistic = as.numeric(
+        recursive_cusum_result$statistic
+      ),
+      P_Value = recursive_cusum_result$p.value,
+      Code_Version = CODE_VERSION
+    )
+    
+    write.csv(
+      cusum_result_df,
+      file.path(
+        OUTPUT_DIR,
+        "TGARCH_X_CUSUM_Test_Result.csv"
+      ),
+      row.names = FALSE
+    )
+    
+    png(
+      file.path(
+        OUTPUT_DIR,
+        "TGARCH_X_CUSUM_Plot.png"
+      ),
+      width = 900,
+      height = 650
+    )
+    plot(
+      recursive_cusum,
+      main = "Recursive CUSUM: Weighted TGARCH-X Forecast Error"
+    )
+    dev.off()
+    
+    breakpoint_full <- breakpoints(
+      Error ~ 1,
+      data = forecast_errors_df,
+      h = 0.15
+    )
+    
+    bic_values <- BIC(breakpoint_full)
+    optimal_breaks <- which.min(bic_values) - 1L
+    
+    breakpoint_bic_df <- data.frame(
+      Number_of_Breaks = 0:(length(bic_values) - 1L),
+      BIC = as.numeric(bic_values),
+      Selected = (
+        0:(length(bic_values) - 1L)
+      ) == optimal_breaks,
+      Code_Version = CODE_VERSION
+    )
+    
+    write.csv(
+      breakpoint_bic_df,
+      file.path(
+        OUTPUT_DIR,
+        "TGARCH_X_Breakpoint_BIC.csv"
+      ),
+      row.names = FALSE
+    )
+    
+    if (optimal_breaks > 0) {
+      selected_breakpoints <- breakpoints(
+        breakpoint_full,
+        breaks = optimal_breaks
+      )
+      
+      breakpoint_indices <- selected_breakpoints$breakpoints
+      breakpoint_indices <- breakpoint_indices[
+        is.finite(breakpoint_indices)
+      ]
+      
+      breakpoint_df <- data.frame(
+        Breakpoint_Number = seq_along(
+          breakpoint_indices
+        ),
+        Observation_Index = breakpoint_indices,
+        Breakpoint_Date = forecast_errors_df$Date[
+          breakpoint_indices
+        ],
+        Code_Version = CODE_VERSION
+      )
+    } else {
+      breakpoint_df <- data.frame(
+        Message = "BIC selected no structural break.",
+        Code_Version = CODE_VERSION
+      )
+    }
+    
+    write.csv(
+      breakpoint_df,
+      file.path(
+        OUTPUT_DIR,
+        "TGARCH_X_Breakpoints.csv"
+      ),
+      row.names = FALSE
+    )
+    
+    png(
+      file.path(
+        OUTPUT_DIR,
+        "TGARCH_X_Breakpoint_Detection.png"
+      ),
+      width = 900,
+      height = 650
+    )
+    plot(
+      breakpoint_full,
+      main = "Breakpoint F-statistics: Weighted TGARCH-X Forecast Error"
+    )
+    dev.off()
+  } else {
+    write.csv(
+      data.frame(
+        Message = "Too few observations for the optional stability analysis."
+      ),
+      file.path(
+        OUTPUT_DIR,
+        "TGARCH_X_Stability_Not_Run.csv"
+      ),
+      row.names = FALSE
+    )
+  }
+}
+
+# =============================================================================
+# 14. REPRODUCIBILITY INFORMATION AND FINAL SUMMARY
+# =============================================================================
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(
+    OUTPUT_DIR,
+    "TGARCH_X_R_Session_Info.txt"
+  )
+)
+
+elapsed_minutes <- as.numeric(
+  difftime(
+    end_time,
+    start_time,
+    units = "mins"
+  )
+)
+
+cat("\n=============================================================================\n")
+cat("TGARCH-X ANALYSIS COMPLETE\n")
+cat("=============================================================================\n")
+cat("Output directory: ", OUTPUT_DIR, "\n", sep = "")
+cat("Sector-date forecasts: ", nrow(results_df), "\n", sep = "")
+cat(
+  "Valid TGARCH-X forecasts: ",
+  successful_fits,
+  " (",
+  sprintf("%.2f", 100 * successful_fits / nrow(results_df)),
+  "%)\n",
+  sep = ""
+)
+cat(
+  "Fallback forecasts: ",
+  fallback_fits,
+  " (",
+  sprintf("%.2f", 100 * fallback_fits / nrow(results_df)),
+  "%)\n",
+  sep = ""
+)
+cat("Runtime: ", round(elapsed_minutes, 2), " minutes\n", sep = "")
+cat("Weighted RMSE: ", sprintf("%.8f", weighted_metrics$RMSE), "\n", sep = "")
+cat("Weighted MAE: ", sprintf("%.8f", weighted_metrics$MAE), "\n", sep = "")
+cat("Weighted QLIKE: ", sprintf("%.8f", weighted_metrics$QLIKE), "\n", sep = "")
+cat("Forecast horizon: one day; use DM h = 1 in later comparison code.\n")
+cat("=============================================================================\n")
