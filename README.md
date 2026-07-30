@@ -1,2 +1,4 @@
 # Technical-Indicators-Journal-Article
-Do Technical Indicators Improve Hybrid Volatility Forecasting? Evidence from a TGARCH-X–Transformer Model of NSE Sectoral Returns
+Leakage-Free Hybrid Stacking of TGARCH-X and Transformer Volatility Forecasts: A Gated Approach to Technical-Indicator Selection
+
+
